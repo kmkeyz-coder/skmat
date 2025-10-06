@@ -1,0 +1,33 @@
+name: Server Autofix (SKM)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'fixes/**'
+      - '.github/workflows/server-autofix.yml'
+
+jobs:
+  apply:
+    runs-on: [self-hosted, linux, skm, autofix]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: (Optional) Set domain for probes
+        run: echo "DOMAIN=cloud.skmatcloud.com" >> $GITHUB_ENV
+
+      - name: Run your fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -x fixes/apply.sh ]]; then
+            echo "[INFO] Running fixes/apply.sh"
+            bash fixes/apply.sh
+          else
+            echo "[WARN] fixes/apply.sh not found or not executable"
+          fi
+
+      - name: Validate & (hot) reload Caddy safely
+        run: /usr/local/bin/skm-safe-apply --reload-caddy
