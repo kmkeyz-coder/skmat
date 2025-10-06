@@ -9,25 +9,23 @@ CADDY_TMP="/etc/caddy/Caddyfile.tmp"
 i(){ echo -e "\e[1;34m[INFO]\e[0m $*"; }
 w(){ echo -e "\e[1;33m[WARN]\e[0m $*"; }
 e(){ echo -e "\e[1;31m[ERR]\e[0m  $*"; }
-
 need(){ command -v "$1" >/dev/null 2>&1 || { e "Missing: $1"; exit 1; }; }
+
 need docker
 need curl
 
-# dockerized validators (avoid host glibc)
 caddy_validate(){
-  docker run --rm \
-    -v /etc/caddy:/etc/caddy:ro \
-    caddy:2 caddy validate --adapter caddyfile --config "$CADDY_TMP"
+  docker run --rm -v /etc/caddy:/etc/caddy:ro caddy:2 \
+    caddy validate --adapter caddyfile --config "$CADDY_TMP"
 }
 
 caddy_reload(){
   if curl -fsS http://127.0.0.1:2019/config >/dev/null 2>&1; then
-    # Adapt to JSON then stream to Admin API (no tmp files)
+    # Adapt current live file then stream JSON to admin API (no tmp path issues)
     docker run --rm -v /etc/caddy:/etc/caddy:ro caddy:2 \
       caddy adapt --adapter caddyfile --config "$CADDYFILE" \
     | docker run --rm --network host curlimages/curl:latest \
-      -sS -X POST -H 'Content-Type: application/json' --data-binary @- \
+      -sS -X POST -H "Content-Type: application/json" --data-binary @- \
       http://127.0.0.1:2019/load >/dev/null
   else
     systemctl restart caddy
@@ -47,21 +45,27 @@ declare -A MAP=(
   [dev]=8443
 )
 
-# Preserve Nextcloud backend IP
+# Preserve Nextcloud backend IP (do not break cloud)
 NEXTCLOUD_CTN="nextcloud-app-1"
 NEXT_IP="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$NEXTCLOUD_CTN" 2>/dev/null || true)"
 if [[ -z "$NEXT_IP" && -f "$CADDYFILE" ]]; then
-  NEXT_IP="$(grep -Eo 'reverse_proxy[[:space:]]+http://([0-9]{1,3}\.){3}[0-9]{1,3}:80' "$CADDYFILE" | head -n1 | sed -E 's#.*http://##; s/:80.*##')"
+  NEXT_IP="$(grep -Eo 'reverse_proxy[[:space:]]+http://([0-9]{1,3}\.){3}[0-9]{1,3}:80' "$CADDYFILE" \
+    | head -n1 | sed -E 's#.*http://##; s/:80.*##')"
 fi
 [[ -z "$NEXT_IP" ]] && { e "Cannot determine Nextcloud IP; aborting to avoid breaking cloud."; exit 0; }
 
-# Detect dev proto
+# Detect dev (code-server) protocol on host :8443 using host networking
 DEV_PROTO="https"
-if ! curl -ksS -o /dev/null https://127.0.0.1:8443/; then
-  DEV_PROTO="http"
+if ! docker run --rm --network host curlimages/curl:latest -ksSf https://127.0.0.1:8443/ >/dev/null 2>&1; then
+  if docker run --rm --network host curlimages/curl:latest -ksSf http://127.0.0.1:8443/ >/dev/null 2>&1; then
+    DEV_PROTO="http"
+  else
+    w "dev on 8443 not reachable; defaulting to HTTPS upstream"
+    DEV_PROTO="https"
+  fi
 fi
 
-# Backup then build strict Caddyfile -> write FIRST to CADDY_TMP
+# Backup live file then write new Caddyfile to CADDY_TMP (mounted path)
 ts="$(date +%F_%H-%M-%S)"
 [[ -f "$CADDYFILE" ]] && cp -a "$CADDYFILE" "${CADDYFILE}.bak.${ts}" || true
 i "Backup: ${CADDYFILE}.bak.${ts}"
@@ -73,10 +77,17 @@ ${host}
 {
     tls internal
     encode gzip zstd
-    handle_path /_health* { respond "OK" 200 }
-    reverse_proxy http://127.0.0.1:${port} {
-        transport http { versions 1.1 }
+
+    handle_path /_health* {
+        respond "OK" 200
     }
+
+    reverse_proxy http://127.0.0.1:${port} {
+        transport http {
+            versions 1.1
+        }
+    }
+
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
         X-Content-Type-Options "nosniff"
@@ -94,13 +105,18 @@ ${host}
 {
     tls internal
     encode gzip zstd
-    handle_path /_health* { respond "OK" 200 }
+
+    handle_path /_health* {
+        respond "OK" 200
+    }
+
     reverse_proxy https://127.0.0.1:${port} {
         transport http {
             tls_insecure_skip_verify
             versions 1.2 1.3
         }
     }
+
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
         X-Content-Type-Options "nosniff"
@@ -112,6 +128,7 @@ V
 }
 
 {
+  # Global options
   cat <<GLOBAL
 {
     admin 127.0.0.1:2019
@@ -119,16 +136,20 @@ V
 }
 GLOBAL
 
-  # Nextcloud (use preserved IP)
+  # Nextcloud (preserve origin IP)
   emit_http "cloud.${DOMAIN_ROOT}" 80 | sed -E "s#http://127\.0\.0\.1:80#http://${NEXT_IP}:80#"
 
-  # Other vhosts
+  # Other subdomains
   for sub in "${!MAP[@]}"; do
     [[ "$sub" == "cloud" ]] && continue
     host="${sub}.${DOMAIN_ROOT}"
     port="${MAP[$sub]}"
     if [[ "$sub" == "dev" ]]; then
-      [[ "$DEV_PROTO" == "https" ]] && emit_https "$host" "$port" || emit_http "$host" "$port"
+      if [[ "$DEV_PROTO" == "https" ]]; then
+        emit_https "$host" "$port"
+      else
+        emit_http "$host" "$port"
+      fi
     else
       emit_http "$host" "$port"
     fi
@@ -146,7 +167,7 @@ CATCH
 i "Validating Caddyfile (dockerized)…"
 caddy_validate
 
-# Promote tmp to live and reload
+# Promote and reload
 cp -f "$CADDY_TMP" "$CADDYFILE"
 i "Reloading Caddy…"
 caddy_reload
