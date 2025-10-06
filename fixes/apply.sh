@@ -111,3 +111,4 @@ fi
 # Write back
 cp -f "$tmp" "$CADDYFILE"
 echo "[INFO] Caddyfile updated (workflow will validate & reload)."
+# trigger 2025-10-06_11:59:49
