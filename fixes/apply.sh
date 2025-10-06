@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -o pipefail
 
 LOG_DIR="/var/log/skm-autofix"
 mkdir -p "$LOG_DIR"
@@ -8,8 +9,8 @@ exec > >(tee -a "$LOG") 2>&1
 
 echo "[INFO] SKM Auto-Fix start: $(date -u +%F_%T)"
 CADDYFILE="/etc/caddy/Caddyfile"
-HEALTH="/_health"
 DOMAIN="${DOMAIN:-cloud.skmatcloud.com}"
+HEALTH="/_health"
 
 ensure_docker() {
   if ! command -v docker >/dev/null 2>&1; then
@@ -24,10 +25,10 @@ normalize_caddy() {
   tmp="$(mktemp)"; trap 'rm -f "$tmp" "$tmp".*' RETURN
   cp -f "$CADDYFILE" "$tmp"
 
-  # Remove accidental garbage lines from earlier paste accidents
+  # Remove garbage lines from earlier paste accidents
   sed -i -E '/^\.\\"ho |^\."\s*ho /d' "$tmp"
 
-  # Remove ambiguous ":80, :443 { ... }" block
+  # Remove ambiguous ':80, :443 { … }' block
   awk '
     BEGIN{drop=0; depth=0}
     /^[[:space:]]*:80[[:space:]]*,[[:space:]]*:443[[:space:]]*\{/ {drop=1; depth=1; next}
@@ -45,7 +46,7 @@ normalize_caddy() {
     }
   ' "$tmp" > "$tmp.1" && mv "$tmp.1" "$tmp"
 
-  # Ensure single :80 block with health and 404
+  # Ensure single :80 block with health + 404
   if grep -qE '^[[:space:]]*:80[[:space:]]*\{' "$tmp"; then
     if ! awk "/^[[:space:]]*:80[[:space:]]*\\{/,/^\\}/ {print}" "$tmp" | grep -q "$HEALTH"; then
       awk -v hp="$HEALTH" '
@@ -65,7 +66,7 @@ normalize_caddy() {
     } >> "$tmp"
   fi
 
-  # Helper to upsert a vhost
+  # Upsert helper
   upsert_block() {
     local host="$1"; shift
     local body="$*"
@@ -73,7 +74,7 @@ normalize_caddy() {
     printf "\n%s {\n%s\n}\n" "$host" "$body" >> "$tmp"
   }
 
-  # Admin/dev subdomains (safe defaults)
+  # Admin/dev vhosts
   upsert_block "dev.skmatcloud.com" $'    encode gzip\n    @health path /_health\n    respond @health "OK" 200\n    reverse_proxy 127.0.0.1:8443'
   upsert_block "portainer.skmatcloud.com" $'    reverse_proxy 127.0.0.1:9001'
   upsert_block "kuma.skmatcloud.com" $'    reverse_proxy 127.0.0.1:3001'
@@ -81,15 +82,14 @@ normalize_caddy() {
   upsert_block "cadvisor.skmatcloud.com" $'    reverse_proxy 127.0.0.1:84'
   upsert_block "admin.skmatcloud.com" $'    reverse_proxy 127.0.0.1:85'
 
-  # Detect Nextcloud (php-fpm or docker), else use CLOUD_UPSTREAM or 127.0.0.1:8080
+  # Cloud upstream: php-fpm, docker, or fallback
   PHPFPM_SOCK="$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1 || true)"
   HAS_DOCKER="false"; command -v docker >/dev/null 2>&1 && HAS_DOCKER="true"
   NEXTCLOUD_DOCKER="false"
   if [[ "$HAS_DOCKER" == "true" ]] && docker ps --format '{{.Names}}' | grep -qi '^nextcloud$'; then
     NEXTCLOUD_DOCKER="true"
   fi
-  CLOUD_UPSTREAM_DEFAULT="127.0.0.1:8080"
-  CLOUD_UPSTREAM="${CLOUD_UPSTREAM:-$CLOUD_UPSTREAM_DEFAULT}"
+  CLOUD_UPSTREAM="${CLOUD_UPSTREAM:-127.0.0.1:8080}"
 
   if [[ -d /var/www/nextcloud && -n "$PHPFPM_SOCK" ]]; then
     echo "[INFO] Using Nextcloud via php-fpm ($PHPFPM_SOCK)"
@@ -107,32 +107,33 @@ normalize_caddy() {
   cp -f "$tmp" "$CADDYFILE"
 }
 
-validate_adapt_reload() {
-  echo "[INFO] Validate via caddy:2"
+validate_and_reload_via_host() {
+  echo "[INFO] Validate Caddyfile with caddy:2…"
   docker run --rm -v /etc/caddy:/etc/caddy:ro caddy:2 \
     caddy validate --adapter caddyfile --config "$CADDYFILE"
 
-  echo "[INFO] Adapt -> JSON"
+  echo "[INFO] Adapt → JSON and reload via host admin API (using curl container + --network host)…"
   docker run --rm -v /etc/caddy:/etc/caddy:ro caddy:2 \
-    caddy adapt --adapter caddyfile --config "$CADDYFILE" > /tmp/caddy_adapt.json
+    caddy adapt --adapter caddyfile --config "$CADDYFILE" \
+  | docker run --rm --network host -i curlimages/curl \
+      -fsS -H "Content-Type: application/json" --data-binary @- \
+      http://127.0.0.1:2019/load
 
-  echo "[INFO] Reload via admin API"
-  curl -fsS -H "Content-Type: application/json" --data-binary @/tmp/caddy_adapt.json \
-    http://127.0.0.1:2019/load
+  echo "[OK] Reloaded via admin API."
 }
 
 health_probe() {
-  echo "[INFO] Probing https://${DOMAIN}/_health"
-  if curl -fsS -k "https://${DOMAIN}/_health" >/dev/null; then
+  echo "[INFO] Probing https://${DOMAIN}/_health via host network"
+  if docker run --rm --network host curlimages/curl -fsS -k "https://${DOMAIN}/_health" >/dev/null; then
     echo "[OK] Health 200"
   else
-    echo "[WARN] Health failed, checking homepage head…"
-    curl -sS -k -I -H "Host: ${DOMAIN}" https://127.0.0.1/ | head -n 5 || true
+    echo "[WARN] Health failed; show headers:"
+    docker run --rm --network host curlimages/curl -sS -k -I -H "Host: ${DOMAIN}" https://127.0.0.1/ | head -n 12 || true
   fi
 }
 
 ensure_docker
 normalize_caddy
-validate_adapt_reload
+validate_and_reload_via_host
 health_probe
-echo "[DONE] SKM Auto-Fix completed: $(date -u +%F_%T) — log: $LOG"
+echo "[DONE] SKM Auto-Fix completed: $(date +%F_%H-%M-%S) — log: $LOG"
