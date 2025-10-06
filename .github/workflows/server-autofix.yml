@@ -1,39 +1,23 @@
 name: Server Autofix (SKM)
-
 on:
   push:
     branches: [ "main", "master" ]
     paths:
       - "fixes/**"
       - ".github/workflows/**"
-
 jobs:
   apply:
     runs-on: [self-hosted, linux, skm, autofix]
     timeout-minutes: 30
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Ensure Docker CLI exists (inside runner)
-        run: |
-          set -e
-          if ! command -v docker >/dev/null 2>&1; then
-            apt-get update -y
-            # Prefer docker.io from Ubuntu/Debian repos (works fine with mounted /var/run/docker.sock)
-            DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io curl ca-certificates
-          fi
-          docker version || true
-          # Verify we can talk to host dockerd via the mounted socket
-          docker ps >/dev/null
-
       - name: Run SKM fixes
         env:
           DOMAIN: cloud.skmatcloud.com
+        run: bash fixes/apply.sh
+      - name: Tail last autofix log (debug)
         run: |
-          bash fixes/apply.sh
-
-      - name: Show latest autofix logs (optional)
-        run: |
-          ls -lt /var/log | head -n 30 || true
-          ls -lt /var/log/skm-autofix | head -n 20 2>/dev/null || true
+          ls -lt /var/log/skm-autofix | head -n 5 2>/dev/null || true
+          lastlog="$(ls -1t /var/log/skm-autofix/*.log 2>/dev/null | head -n1 || true)"
+          [ -n "$lastlog" ] && tail -n 120 "$lastlog" || true
