@@ -1,10 +1,13 @@
 name: Server Autofix (SKM)
+
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main", "master" ]
+    branches: [ main ]
     paths:
       - "fixes/**"
-      - ".github/workflows/**"
+      - ".github/workflows/server-autofix.yml"
+
 jobs:
   apply:
     runs-on: [self-hosted, linux, skm, autofix]
@@ -12,12 +15,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Run SKM fixes
-        env:
-          DOMAIN: cloud.skmatcloud.com
-        run: bash fixes/apply.sh
-      - name: Tail last autofix log (debug)
+
+      - name: Run auto-fix
+        shell: bash
         run: |
-          ls -lt /var/log/skm-autofix | head -n 5 2>/dev/null || true
-          lastlog="$(ls -1t /var/log/skm-autofix/*.log 2>/dev/null | head -n1 || true)"
-          [ -n "$lastlog" ] && tail -n 120 "$lastlog" || true
+          set -euo pipefail
+          bash fixes/apply.sh

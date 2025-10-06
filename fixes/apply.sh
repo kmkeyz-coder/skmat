@@ -1,139 +1,171 @@
 #!/usr/bin/env bash
 set -euo pipefail
-set -o pipefail
 
-LOG_DIR="/var/log/skm-autofix"
-mkdir -p "$LOG_DIR"
-LOG="$LOG_DIR/$(date +%F_%H-%M-%S).log"
-exec > >(tee -a "$LOG") 2>&1
-
-echo "[INFO] SKM Auto-Fix start: $(date -u +%F_%T)"
+EMAIL="admin@cloud.skmatcloud.com"
+DOMAIN_ROOT="skmatcloud.com"
 CADDYFILE="/etc/caddy/Caddyfile"
-DOMAIN="${DOMAIN:-cloud.skmatcloud.com}"
-HEALTH="/_health"
 
-ensure_docker() {
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "[INFO] Installing docker CLI in runner..."
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io curl ca-certificates
+i(){ echo -e "\e[1;34m[INFO]\e[0m $*"; }
+w(){ echo -e "\e[1;33m[WARN]\e[0m $*"; }
+e(){ echo -e "\e[1;31m[ERR]\e[0m  $*"; }
+
+need(){ command -v "$1" >/dev/null 2>&1 || { e "Missing: $1"; exit 1; }; }
+need docker
+need curl
+
+# Validate with dockerized caddy to avoid host glibc issues
+caddy_validate(){
+  docker run --rm -v /etc/caddy:/etc/caddy:ro caddy:2 \
+    caddy validate --adapter caddyfile --config "$1"
+}
+
+# Hot reload via admin API (fallback to service restart)
+caddy_reload(){
+  local cfg="$1"
+  if curl -fsS http://127.0.0.1:2019/config >/dev/null 2>&1; then
+    # adapt to JSON then POST using curl container (host net)
+    docker run --rm --network host -v /etc/caddy:/etc/caddy:ro caddy:2 \
+      caddy adapt --adapter caddyfile --config "$cfg" >/tmp/caddy.json
+    docker run --rm --network host curlimages/curl:latest \
+      -sS -X POST -H 'Content-Type: application/json' --data-binary @/tmp/caddy.json \
+      http://127.0.0.1:2019/load >/dev/null
+  else
+    systemctl restart caddy
   fi
 }
 
-normalize_caddy() {
-  echo "[INFO] Normalising Caddyfile…"
-  tmp="$(mktemp)"; trap 'rm -f "$tmp" "$tmp".*' RETURN
-  cp -f "$CADDYFILE" "$tmp"
+# Map subdomain -> local port (HTTP unless noted)
+declare -A MAP=(
+  [portainer]=9001
+  [kuma]=3001
+  [dozzle]=9999
+  [cadvisor]=84
+  [admin]=85
+  [espocrm]=14080
+  [picpeak]=3000
+  [picpeak-api]=5000
+  [dev]=8443
+)
 
-  # Remove garbage lines from earlier paste accidents
-  sed -i -E '/^\.\\"ho |^\."\s*ho /d' "$tmp"
+# Preserve working Nextcloud upstream IP
+NEXTCLOUD_CTN="nextcloud-app-1"
+NEXT_IP="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$NEXTCLOUD_CTN" 2>/dev/null || true)"
+if [[ -z "$NEXT_IP" && -f "$CADDYFILE" ]]; then
+  NEXT_IP="$(grep -Eo 'reverse_proxy[[:space:]]+http://([0-9]{1,3}\.){3}[0-9]{1,3}:80' "$CADDYFILE" | head -n1 | sed -E 's/.*http:\/\///; s/:80.*//')"
+fi
+[[ -z "$NEXT_IP" ]] && { e "Cannot determine Nextcloud IP; aborting to avoid breaking cloud."; exit 0; }
 
-  # Remove ambiguous ':80, :443 { … }' block
-  awk '
-    BEGIN{drop=0; depth=0}
-    /^[[:space:]]*:80[[:space:]]*,[[:space:]]*:443[[:space:]]*\{/ {drop=1; depth=1; next}
-    {
-      if(drop){
-        for(i=1;i<=length($0);i++){
-          c=substr($0,i,1)
-          if(c=="{") depth++
-          else if(c=="}") depth--
-        }
-        if(depth<=0){ drop=0 }
-        next
-      }
-      print
+# Detect dev proto on 8443 (prefer HTTPS, fallback HTTP)
+DEV_PROTO="https"
+if ! curl -ksS -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ >/dev/null 2>&1; then
+  DEV_PROTO="http"
+fi
+
+# Backup and build strict Caddyfile
+ts="$(date +%F_%H-%M-%S)"
+[[ -f "$CADDYFILE" ]] && cp -a "$CADDYFILE" "${CADDYFILE}.bak.${ts}" || true
+i "Backup: ${CADDYFILE}.bak.${ts}"
+tmp="$(mktemp)"
+
+cat > "$tmp" <<GLOBAL
+{
+    admin 127.0.0.1:2019
+    email ${EMAIL}
+}
+GLOBAL
+
+emit_http(){
+  local host="$1" port="$2"
+  cat <<V
+${host}
+{
+    tls internal
+    encode gzip zstd
+    handle_path /_health* { respond "OK" 200 }
+    reverse_proxy http://127.0.0.1:${port} {
+        transport http { versions 1.1 }
     }
-  ' "$tmp" > "$tmp.1" && mv "$tmp.1" "$tmp"
-
-  # Ensure single :80 block with health + 404
-  if grep -qE '^[[:space:]]*:80[[:space:]]*\{' "$tmp"; then
-    if ! awk "/^[[:space:]]*:80[[:space:]]*\\{/,/^\\}/ {print}" "$tmp" | grep -q "$HEALTH"; then
-      awk -v hp="$HEALTH" '
-        /^[[:space:]]*:80[[:space:]]*\{/ {print; print "    handle_path " hp "* {"; print "        respond \"OK\" 200"; print "    }"; next}
-        {print}
-      ' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
-    fi
-  else
-    {
-      echo
-      echo ":80 {"
-      echo "    handle_path ${HEALTH}* {"
-      echo "        respond \"OK\" 200"
-      echo "    }"
-      echo "    respond \"Not configured\" 404"
-      echo "}"
-    } >> "$tmp"
-  fi
-
-  # Upsert helper
-  upsert_block() {
-    local host="$1"; shift
-    local body="$*"
-    sed -i -E "/^${host//./\\.}[[:space:]]*\\{/,/^\\}/d" "$tmp"
-    printf "\n%s {\n%s\n}\n" "$host" "$body" >> "$tmp"
-  }
-
-  # Admin/dev vhosts
-  upsert_block "dev.skmatcloud.com" $'    encode gzip\n    @health path /_health\n    respond @health "OK" 200\n    reverse_proxy 127.0.0.1:8443'
-  upsert_block "portainer.skmatcloud.com" $'    reverse_proxy 127.0.0.1:9001'
-  upsert_block "kuma.skmatcloud.com" $'    reverse_proxy 127.0.0.1:3001'
-  upsert_block "dozzle.skmatcloud.com" $'    reverse_proxy 127.0.0.1:9999'
-  upsert_block "cadvisor.skmatcloud.com" $'    reverse_proxy 127.0.0.1:84'
-  upsert_block "admin.skmatcloud.com" $'    reverse_proxy 127.0.0.1:85'
-
-  # Cloud upstream: php-fpm, docker, or fallback
-  PHPFPM_SOCK="$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1 || true)"
-  HAS_DOCKER="false"; command -v docker >/dev/null 2>&1 && HAS_DOCKER="true"
-  NEXTCLOUD_DOCKER="false"
-  if [[ "$HAS_DOCKER" == "true" ]] && docker ps --format '{{.Names}}' | grep -qi '^nextcloud$'; then
-    NEXTCLOUD_DOCKER="true"
-  fi
-  CLOUD_UPSTREAM="${CLOUD_UPSTREAM:-127.0.0.1:8080}"
-
-  if [[ -d /var/www/nextcloud && -n "$PHPFPM_SOCK" ]]; then
-    echo "[INFO] Using Nextcloud via php-fpm ($PHPFPM_SOCK)"
-    upsert_block "$DOMAIN" $'    root * /var/www/nextcloud\n    encode gzip\n    php_fastcgi unix/'"$PHPFPM_SOCK"$'\n    file_server\n\n    @health path /_health\n    respond @health "OK" 200\n\n    handle_path /.well-known/carddav   { redir /remote.php/dav 301 }\n    handle_path /.well-known/caldav    { redir /remote.php/dav 301 }\n    handle_path /.well-known/webfinger { redir /index.php/.well-known/webfinger 301 }\n    handle_path /.well-known/nodeinfo  { redir /index.php/.well-known/nodeinfo 301 }'
-  elif [[ "$NEXTCLOUD_DOCKER" == "true" ]]; then
-    TARGET="$(docker port nextcloud 2>/dev/null | awk -F' -> ' '/0\.0\.0\.0|127\.0\.0\.1/ {print $2}' | head -n1)"
-    [[ -n "$TARGET" ]] || TARGET="nextcloud:80"
-    echo "[INFO] Using Nextcloud docker upstream: $TARGET"
-    upsert_block "$DOMAIN" $'    encode gzip\n    @health path /_health\n    respond @health "OK" 200\n    reverse_proxy '"$TARGET"
-  else
-    echo "[INFO] Using generic upstream: $CLOUD_UPSTREAM"
-    upsert_block "$DOMAIN" $'    encode gzip\n    @health path /_health\n    respond @health "OK" 200\n    reverse_proxy '"$CLOUD_UPSTREAM"
-  fi
-
-  cp -f "$tmp" "$CADDYFILE"
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        X-Frame-Options "SAMEORIGIN"
+    }
+}
+V
 }
 
-validate_and_reload_via_host() {
-  echo "[INFO] Validate Caddyfile with caddy:2…"
-  docker run --rm -v /etc/caddy:/etc/caddy:ro caddy:2 \
-    caddy validate --adapter caddyfile --config "$CADDYFILE"
-
-  echo "[INFO] Adapt → JSON and reload via host admin API (using curl container + --network host)…"
-  docker run --rm -v /etc/caddy:/etc/caddy:ro caddy:2 \
-    caddy adapt --adapter caddyfile --config "$CADDYFILE" \
-  | docker run --rm --network host -i curlimages/curl \
-      -fsS -H "Content-Type: application/json" --data-binary @- \
-      http://127.0.0.1:2019/load
-
-  echo "[OK] Reloaded via admin API."
+emit_https(){
+  local host="$1" port="$2"
+  cat <<V
+${host}
+{
+    tls internal
+    encode gzip zstd
+    handle_path /_health* { respond "OK" 200 }
+    reverse_proxy https://127.0.0.1:${port} {
+        transport http {
+            tls_insecure_skip_verify
+            versions 1.2 1.3
+        }
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        X-Frame-Options "SAMEORIGIN"
+    }
+}
+V
 }
 
-health_probe() {
-  echo "[INFO] Probing https://${DOMAIN}/_health via host network"
-  if docker run --rm --network host curlimages/curl -fsS -k "https://${DOMAIN}/_health" >/dev/null; then
-    echo "[OK] Health 200"
+# Nextcloud (preserve origin IP)
+emit_http "cloud.${DOMAIN_ROOT}" 80 | sed -E "s#http://127\.0\.0\.1:80#http://${NEXT_IP}:80#" >> "$tmp"
+
+# Other vhosts
+for sub in "${!MAP[@]}"; do
+  [[ "$sub" == "cloud" ]] && continue
+  host="${sub}.${DOMAIN_ROOT}"
+  port="${MAP[$sub]}"
+  if [[ "$sub" == "dev" ]]; then
+    [[ "$DEV_PROTO" == "https" ]] && emit_https "$host" "$port" >> "$tmp" || emit_http "$host" "$port" >> "$tmp"
   else
-    echo "[WARN] Health failed; show headers:"
-    docker run --rm --network host curlimages/curl -sS -k -I -H "Host: ${DOMAIN}" https://127.0.0.1/ | head -n 12 || true
+    emit_http "$host" "$port" >> "$tmp"
   fi
-}
+done
 
-ensure_docker
-normalize_caddy
-validate_and_reload_via_host
-health_probe
-echo "[DONE] SKM Auto-Fix completed: $(date +%F_%H-%M-%S) — log: $LOG"
+# Catch-all HTTP
+cat >> "$tmp" <<'CATCH'
+:80
+{
+    respond "Not configured" 404
+}
+CATCH
+
+i "Validating Caddyfile…"
+caddy_validate "$tmp"
+
+# Activate
+cp -f "$tmp" "$CADDYFILE"
+i "Reloading Caddy…"
+caddy_reload "$CADDYFILE"
+
+# Probes (SNI + HTTP/1.1)
+DOMS=(cloud.${DOMAIN_ROOT} portainer.${DOMAIN_ROOT} kuma.${DOMAIN_ROOT} dozzle.${DOMAIN_ROOT} cadvisor.${DOMAIN_ROOT} admin.${DOMAIN_ROOT} espocrm.${DOMAIN_ROOT} picpeak.${DOMAIN_ROOT} picpeak-api.${DOMAIN_ROOT} dev.${DOMAIN_ROOT})
+
+echo
+i "SNI /_health (HTTP/1.1, bypass CF):"
+for d in "${DOMS[@]}"; do
+  code=$(curl --http1.1 -ksS --resolve "${d}:443:127.0.0.1" -o /dev/null -w '%{http_code}' "https://${d}/_health" || echo 000)
+  printf "%-28s https:%s\n" "$d" "$code"
+done
+
+echo
+i "SNI homepage (HTTP/1.1):"
+for d in "${DOMS[@]}"; do
+  code=$(curl --http1.1 -ksS --resolve "${d}:443:127.0.0.1" -o /dev/null -w '%{http_code}' "https://${d}/" || echo 000)
+  printf "%-28s https:%s\n" "$d" "$code"
+done
+
+# Never fail the job just because a backend app is down
+exit 0
